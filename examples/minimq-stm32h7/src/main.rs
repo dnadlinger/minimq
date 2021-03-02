@@ -4,98 +4,64 @@
 #[macro_use]
 extern crate log;
 
-use smoltcp as net;
-use stm32h7xx_hal::{gpio::Speed, prelude::*, ethernet};
+use stm32h7xx_hal::{
+    ethernet::{self, PHY},
+    gpio::Speed,
+    prelude::*,
+};
 
 use heapless::{consts, String};
 
-use cortex_m;
-
 use panic_halt as _;
-use serde::{Deserialize, Serialize};
-
 use rtic::cyccnt::{Instant, U32Ext};
+use serde::Serialize;
 
-mod tcp_stack;
+use smoltcp_nal::smoltcp;
 
 use minimq::{
     embedded_nal::{IpAddr, Ipv4Addr},
     MqttClient, QoS,
 };
-use tcp_stack::NetworkStack;
 
 pub struct NetStorage {
-    ip_addrs: [net::wire::IpCidr; 1],
-    neighbor_cache: [Option<(net::wire::IpAddress, net::iface::Neighbor)>; 8],
+    pub ip_addrs: [smoltcp::wire::IpCidr; 1],
+    pub sockets: [Option<smoltcp::socket::SocketSetItem<'static>>; 1],
+    neighbor_cache: [Option<(smoltcp::wire::IpAddress, smoltcp::iface::Neighbor)>; 8],
+    pub tx_storage: [u8; 4096],
+    pub rx_storage: [u8; 4096],
+}
+
+#[derive(Serialize)]
+struct Random {
+    random: Option<u32>,
 }
 
 static mut NET_STORE: NetStorage = NetStorage {
     // Placeholder for the real IP address, which is initialized at runtime.
-    ip_addrs: [net::wire::IpCidr::Ipv6(
-        net::wire::Ipv6Cidr::SOLICITED_NODE_PREFIX,
+    ip_addrs: [smoltcp::wire::IpCidr::Ipv6(
+        smoltcp::wire::Ipv6Cidr::SOLICITED_NODE_PREFIX,
     )],
+    sockets: [None; 1],
     neighbor_cache: [None; 8],
+    rx_storage: [0; 4096],
+    tx_storage: [0; 4096],
 };
 
 #[link_section = ".sram3.eth"]
 static mut DES_RING: ethernet::DesRing = ethernet::DesRing::new();
 
-#[derive(Serialize, Deserialize)]
-struct Random {
-    random: Option<u32>
-}
-
-type NetworkInterface =
-    net::iface::EthernetInterface<'static, 'static, 'static, ethernet::EthernetDMA<'static>>;
-
-macro_rules! add_socket {
-    ($sockets:ident, $tx_storage:ident, $rx_storage:ident) => {
-        let mut $rx_storage = [0; 4096];
-        let mut $tx_storage = [0; 4096];
-
-        let tcp_socket = {
-            let tx_buffer = net::socket::TcpSocketBuffer::new(&mut $tx_storage[..]);
-            let rx_buffer = net::socket::TcpSocketBuffer::new(&mut $rx_storage[..]);
-
-            net::socket::TcpSocket::new(tx_buffer, rx_buffer)
-        };
-
-        let _handle = $sockets.add(tcp_socket);
-    };
-}
-
-#[cfg(not(feature = "semihosting"))]
-fn init_log() {}
-
-#[cfg(feature = "semihosting")]
-fn init_log() {
-    use cortex_m_log::log::{init as init_log, Logger};
-    use cortex_m_log::printer::semihosting::{hio::HStdout, InterruptOk};
-    use log::LevelFilter;
-
-    static mut LOGGER: Option<Logger<InterruptOk<HStdout>>> = None;
-
-    let logger = Logger {
-        inner: InterruptOk::<_>::stdout().unwrap(),
-        level: LevelFilter::Info,
-    };
-
-    let logger = unsafe { LOGGER.get_or_insert(logger) };
-
-    init_log(logger).unwrap();
-}
+type NetworkStack =
+    smoltcp_nal::NetworkStack<'static, 'static, stm32h7xx_hal::ethernet::EthernetDMA<'static>>;
 
 #[rtic::app(device = stm32h7xx_hal::stm32, peripherals = true, monotonic = rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
-        net_interface: NetworkInterface,
+        client: MqttClient<minimq::consts::U256, NetworkStack>,
         rng: stm32h7xx_hal::rng::Rng,
     }
 
     #[init]
     fn init(mut c: init::Context) -> init::LateResources {
-        c.core.DWT.enable_cycle_counter();
-
         // Enable SRAM3 for the descriptor ring.
         c.device.RCC.ahb2enr.modify(|_, w| w.sram3en().set_bit());
 
@@ -107,11 +73,7 @@ const APP: () = {
             .sysclk(400.mhz())
             .hclk(200.mhz())
             .per_ck(100.mhz())
-            .pll2_p_ck(100.mhz())
-            .pll2_q_ck(100.mhz())
             .freeze(vos, &c.device.SYSCFG);
-
-        init_log();
 
         let gpioa = c.device.GPIOA.split(ccdr.peripheral.GPIOA);
         let gpiob = c.device.GPIOB.split(ccdr.peripheral.GPIOB);
@@ -132,64 +94,78 @@ const APP: () = {
         }
 
         // Configure ethernet
-        let net_interface = {
-            let mac_addr = net::wire::EthernetAddress([0xAC, 0x6F, 0x7A, 0xDE, 0xD6, 0xC8]);
-            let (eth_dma, _eth_mac) = unsafe {
+        let network_stack = {
+            let mac_addr = smoltcp::wire::EthernetAddress([0xAC, 0x6F, 0x7A, 0xDE, 0xD6, 0xC8]);
+            let (eth_dma, eth_mac) = unsafe {
                 ethernet::new_unchecked(
                     c.device.ETHERNET_MAC,
                     c.device.ETHERNET_MTL,
                     c.device.ETHERNET_DMA,
                     &mut DES_RING,
-                    mac_addr.clone(),
+                    mac_addr,
+                    ccdr.peripheral.ETH1MAC,
+                    &ccdr.clocks,
                 )
             };
+
+            let mut lan8742a = ethernet::phy::LAN8742A::new(eth_mac.set_phy_addr(0));
+            lan8742a.phy_reset();
+            lan8742a.phy_init();
 
             unsafe { ethernet::enable_interrupt() }
 
             let store = unsafe { &mut NET_STORE };
 
-            store.ip_addrs[0] = net::wire::IpCidr::new(net::wire::IpAddress::v4(10, 0, 0, 2), 24);
+            store.ip_addrs[0] =
+                smoltcp::wire::IpCidr::new(smoltcp::wire::IpAddress::v4(10, 0, 0, 2), 24);
 
-            let neighbor_cache = net::iface::NeighborCache::new(&mut store.neighbor_cache[..]);
+            let neighbor_cache = smoltcp::iface::NeighborCache::new(&mut store.neighbor_cache[..]);
 
-            net::iface::EthernetInterfaceBuilder::new(eth_dma)
+            let interface = smoltcp::iface::EthernetInterfaceBuilder::new(eth_dma)
                 .ethernet_addr(mac_addr)
                 .neighbor_cache(neighbor_cache)
                 .ip_addrs(&mut store.ip_addrs[..])
-                .finalize()
+                .finalize();
+
+            let sockets = {
+                let mut sockets = smoltcp::socket::SocketSet::new(&mut store.sockets[..]);
+                let tcp_socket = {
+                    let rx_buffer =
+                        smoltcp::socket::TcpSocketBuffer::new(&mut store.rx_storage[..]);
+                    let tx_buffer =
+                        smoltcp::socket::TcpSocketBuffer::new(&mut store.tx_storage[..]);
+                    smoltcp::socket::TcpSocket::new(rx_buffer, tx_buffer)
+                };
+
+                sockets.add(tcp_socket);
+                sockets
+            };
+
+            NetworkStack::new(interface, sockets)
         };
 
-
+        let client = MqttClient::<consts::U256, _>::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            "nucleo",
+            network_stack,
+        )
+        .unwrap();
 
         // Initialize random number generator
         let rng = c.device.RNG.constrain(ccdr.peripheral.RNG, &ccdr.clocks);
 
-        c.core.SCB.enable_icache();
+        // Enable the cycle counter.
+        c.core.DWT.enable_cycle_counter();
 
-        init::LateResources {
-            net_interface: net_interface,
-            rng: rng,
-        }
+        init::LateResources { client, rng }
     }
 
-    #[idle(resources=[net_interface, rng])]
+    #[idle(resources=[client, rng])]
     fn idle(c: idle::Context) -> ! {
         let mut time: u32 = 0;
         let mut next_ms = Instant::now();
 
         next_ms += 400_00.cycles();
-
-        let mut socket_set_entries: [_; 8] = Default::default();
-        let mut sockets = net::socket::SocketSet::new(&mut socket_set_entries[..]);
-        add_socket!(sockets, rx_storage, tx_storage);
-
-        let tcp_stack = NetworkStack::new(c.resources.net_interface, sockets);
-        let mut client = MqttClient::<consts::U256, _>::new(
-            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-            "nucleo",
-            tcp_stack,
-        )
-        .unwrap();
 
         loop {
             let tick = Instant::now() > next_ms;
@@ -200,48 +176,40 @@ const APP: () = {
             }
 
             if tick && (time % 1000) == 0 {
-                client
+                c.resources
+                    .client
                     .publish("nucleo", "Hello, World!".as_bytes(), QoS::AtMostOnce, &[])
                     .unwrap();
 
                 let random = Random {
-                    random: c.resources.rng.gen().ok()
+                    random: c.resources.rng.gen().ok(),
                 };
 
-                let random: String<consts::U256> =
-                    serde_json_core::to_string(&random).unwrap();
-                client
-                    .publish(
-                        "random",
-                        &random.into_bytes(),
-                        QoS::AtMostOnce,
-                        &[],
-                    )
+                let random: String<consts::U256> = serde_json_core::to_string(&random).unwrap();
+                c.resources
+                    .client
+                    .publish("random", &random.into_bytes(), QoS::AtMostOnce, &[])
                     .unwrap();
             }
 
-            match client
+            match c
+                .resources
+                .client
                 .poll(|_client, topic, message, _properties| match topic {
                     _ => info!("On '{:?}', received: {:?}", topic, message),
-                })
-            {
-                Ok(_) => {},
+                }) {
+                Ok(_) => {}
                 // If we got disconnected from the broker
                 Err(minimq::Error::Disconnected) => {
                     info!("MQTT client disconnected")
-                },
+                }
                 Err(e) => {
                     panic!("{:#?}", e);
                 }
             };
 
-
             // Update the TCP stack.
-            let sleep = client.network_stack.update(time);
-            if sleep {
-                //cortex_m::asm::wfi();
-                cortex_m::asm::nop();
-            }
+            c.resources.client.network_stack.poll(time);
         }
     }
 
